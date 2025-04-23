@@ -2,7 +2,18 @@
 
 ## Overview
 
-This repository contains the training code for our research on **Learning Vision-based Agile Flight via Differentiable Physics**.
+This repository contains the training code for our research on **Learning Vision-based Agile Flight via Differentiable Physics**. If using this repository, please cite our work
+```
+@misc{zhang2024newtonslawslearningvisionbased,
+      title={Back to Newton's Laws: Learning Vision-based Agile Flight via Differentiable Physics}, 
+      author={Yuang Zhang and Yu Hu and Yunlong Song and Danping Zou and Weiyao Lin},
+      year={2024},
+      eprint={2407.10648},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2407.10648}, 
+}
+```
 
 ## Environment Setup
 ### Python Environment
@@ -35,7 +46,7 @@ python main_cuda.py $(cat configs/single_agent.args)
 ```
 
 ## Evaluation
-
+You need to download the simulation [validation code](https://sjtueducn-my.sharepoint.com/:f:/g/personal/zyayoung_sjtu_edu_cn/EjDy1kFC585No8ieIcTyMcABlTxtYFJFi7WQbubki6t9sA?e=G5KO6E).
 To evaluate the trained model in multi-agent settings, use the following command to launch the simulator:
 ```bash
 cd <path to multi agent code supplementary>
