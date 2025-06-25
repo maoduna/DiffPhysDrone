@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository contains the training code for our research on **Learning Vision-based Agile Flight via Differentiable Physics**. Accepted by **Nature Machine Intelligence'25**. [Project webpage](https://henryhuyu.github.io/DiffPhysDrone_Web/) is alive.
+This repository contains the training code for our research on **Learning Vision-based Agile Flight via Differentiable Physics**. Accepted by [**Nature Machine Intelligence'25**](https://www.nature.com/articles/s42256-025-01048-0). [Project webpage](https://henryhuyu.github.io/DiffPhysDrone_Web/) is alive.
 
 ## Quick Demos
 
