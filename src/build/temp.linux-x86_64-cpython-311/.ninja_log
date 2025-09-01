@@ -1,0 +1,4 @@
+# ninja log v5
+1	16553	1756707132716001513	/home/mjj/Cursor_Proj/DiffPhysDrone/src/build/temp.linux-x86_64-cpython-311/quadsim.o	f7d6d497a18f5ca8
+1	40367	1756707156524226181	/home/mjj/Cursor_Proj/DiffPhysDrone/src/build/temp.linux-x86_64-cpython-311/quadsim_kernel.o	4749a83dc5e31572
+0	40487	1756707156640227274	/home/mjj/Cursor_Proj/DiffPhysDrone/src/build/temp.linux-x86_64-cpython-311/dynamics_kernel.o	79f6a3bff26cc67b
