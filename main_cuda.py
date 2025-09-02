@@ -14,171 +14,201 @@ import argparse
 from model import Model
 
 
-# 命令行参数解析 - 控制训练的所有超参数
-parser = argparse.ArgumentParser()
-parser.add_argument('--resume', default=None, help='从检查点恢复训练的路径')
-parser.add_argument('--batch_size', type=int, default=64, help='批次大小，同时训练的无人机数量')
-parser.add_argument('--num_iters', type=int, default=50000, help='总训练迭代次数')
+# =============== 四旋翼无人机强化学习训练参数配置 ===============
+# 该项目使用可微分物理仿真训练视觉导航策略，支持多种环境配置和损失函数
+parser = argparse.ArgumentParser(description='四旋翼无人机视觉导航训练系统')
 
-# 损失函数系数 - 用于平衡不同训练目标
-parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重：滑窗均速与目标速度的SmoothL1')
-parser.add_argument('--coef_speed', type=float, default=0.0, help='遗留参数，通常为0')
-parser.add_argument('--coef_v_pred', type=float, default=2.0, help='速度估计损失权重：网络预测速度vs真实速度的MSE')
-parser.add_argument('--coef_collide', type=float, default=2.0, help='碰撞惩罚权重：距离障碍物过近时的softplus损失')
-parser.add_argument('--coef_obj_avoidance', type=float, default=1.5, help='避障距离权重：二次屏障函数，鼓励保持安全距离')
-parser.add_argument('--coef_d_acc', type=float, default=0.01, help='加速度正则化权重：||控制输出||^2，平滑控制')
-parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='加速度变化率正则化权重：||Δ控制||^2，平滑控制变化')
-parser.add_argument('--coef_d_snap', type=float, default=0.0, help='遗留参数：加速度二阶变化率正则化')
-parser.add_argument('--coef_ground_affinity', type=float, default=0., help='遗留参数：地面亲和性')
-parser.add_argument('--coef_bias', type=float, default=0.0, help='遗留参数：速度方向偏置损失')
+# 训练基本配置
+parser.add_argument('--resume', default=None, help='模型检查点路径，用于恢复训练')
+parser.add_argument('--batch_size', type=int, default=64, help='批次大小：同时仿真的无人机数量，影响GPU内存使用和训练效率')
+parser.add_argument('--num_iters', type=int, default=50000, help='总训练迭代次数，每次迭代包含完整的时序展开')
 
-# 优化器参数
-parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
-parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减因子，用于长时序梯度稳定')
+# =============== 损失函数权重配置 ===============
+# 多目标学习：通过加权组合不同损失函数实现复杂行为
+parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失：使用30步滑窗平均速度与目标速度的SmoothL1损失，主要训练目标')
+parser.add_argument('--coef_speed', type=float, default=0.0, help='[已弃用] 速度大小损失，现版本中权重通常设为0')
+parser.add_argument('--coef_v_pred', type=float, default=2.0, help='速度估计损失：网络预测速度与真实速度的MSE，训练速度感知能力')
+parser.add_argument('--coef_collide', type=float, default=2.0, help='碰撞避免损失：使用softplus函数对负距离（碰撞）施加指数惩罚')
+parser.add_argument('--coef_obj_avoidance', type=float, default=1.5, help='避障距离损失：二次屏障函数，当距离<1米时产生二次惩罚')
+parser.add_argument('--coef_d_acc', type=float, default=0.01, help='控制平滑性：加速度幅值的L2正则化，防止剧烈控制动作')
+parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='控制变化平滑性：相邻时刻加速度差的L2正则化，减少抖动')
+parser.add_argument('--coef_d_snap', type=float, default=0.0, help='[已弃用] 加速度二阶导数正则化，现版本中权重为0')
+parser.add_argument('--coef_ground_affinity', type=float, default=0., help='[已弃用] 地面亲和性损失，现版本中权重为0')
+parser.add_argument('--coef_bias', type=float, default=0.0, help='[已弃用] 速度方向偏置损失，现版本中权重为0')
 
-# 环境参数
-parser.add_argument('--speed_mtp', type=float, default=1.0, help='速度倍数，影响最大飞行速度')
-parser.add_argument('--fov_x_half_tan', type=float, default=0.53, help='相机水平视场角的半角正切值')
-parser.add_argument('--timesteps', type=int, default=150, help='每个训练序列的时间步数')
-parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角度（度）')
+# =============== 优化器和学习率配置 ===============
+parser.add_argument('--lr', type=float, default=1e-3, help='AdamW优化器初始学习率，使用余弦退火调度')
+parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减因子：控制长时序反向传播中的梯度稳定性，防止梯度爆炸')
 
-# 环境配置开关
-parser.add_argument('--single', default=False, action='store_true', help='单机模式vs多机编队')
-parser.add_argument('--gate', default=False, action='store_true', help='是否添加门型障碍物')
-parser.add_argument('--ground_voxels', default=False, action='store_true', help='是否添加地面体素障碍')
-parser.add_argument('--scaffold', default=False, action='store_true', help='是否添加脚手架结构')
-parser.add_argument('--random_rotation', default=False, action='store_true', help='是否随机旋转环境')
-parser.add_argument('--yaw_drift', default=False, action='store_true', help='是否添加偏航漂移扰动')
-parser.add_argument('--no_odom', default=False, action='store_true', help='是否禁用里程计输入（仅视觉）')
+# =============== 仿真环境物理参数 ===============
+parser.add_argument('--speed_mtp', type=float, default=1.0, help='速度倍率：控制无人机最大飞行速度，影响任务难度')
+parser.add_argument('--fov_x_half_tan', type=float, default=0.53, help='相机水平视场角的半角正切值，决定观察范围（约53°视场角）')
+parser.add_argument('--timesteps', type=int, default=150, help='每个训练序列的时间步数，对应约10秒飞行时间（15Hz控制频率）')
+parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角度（度），模拟真实无人机相机安装角度')
+
+# =============== 环境多样化配置开关 ===============
+# 通过不同组合创建多样化训练场景，提高策略泛化能力
+parser.add_argument('--single', default=False, action='store_true', help='启用单机模式（vs默认多机编队），简化避障任务')
+parser.add_argument('--gate', default=False, action='store_true', help='添加门型障碍物：四根柱子构成的方形门，增加穿越任务难度')
+parser.add_argument('--ground_voxels', default=False, action='store_true', help='添加地面体素障碍：模拟地形起伏和地面建筑')
+parser.add_argument('--scaffold', default=False, action='store_true', help='添加脚手架结构：规则网格状障碍物，模拟建筑工地环境')
+parser.add_argument('--random_rotation', default=False, action='store_true', help='随机旋转整个环境：增加方向泛化能力')
+parser.add_argument('--yaw_drift', default=False, action='store_true', help='添加偏航漂移：模拟真实飞行中的姿态漂移干扰')
+parser.add_argument('--no_odom', default=False, action='store_true', help='禁用里程计输入：纯视觉导航模式，更接近真实场景')
 
 args = parser.parse_args()
-writer = SummaryWriter()  # 创建TensorBoard写入器
+writer = SummaryWriter()  # TensorBoard日志记录器，用于可视化训练过程
 print(args)
 
-# 设备配置
-device = torch.device('cuda')
+# =============== 系统初始化配置 ===============
+device = torch.device('cuda')  # 使用GPU加速，CUDA核心函数要求
 
-# 创建可微分物理仿真环境
-# 参数说明：batch_size, width=64, height=48, grad_decay, device, 其他环境配置...
+# =============== 创建可微分物理仿真环境 ===============
+# Env类集成了完整的四旋翼动力学模型、障碍物渲染和碰撞检测
+# 深度图分辨率: 64x48像素，通过4x下采样得到16x12的网络输入
 env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           fov_x_half_tan=args.fov_x_half_tan, single=args.single,
           gate=args.gate, ground_voxels=args.ground_voxels,
           scaffold=args.scaffold, speed_mtp=args.speed_mtp,
           random_rotation=args.random_rotation, cam_angle=args.cam_angle)
 
-# 创建策略网络模型
-# 输入维度取决于是否使用里程计：
-# - 无里程计：7维 [目标速度(3) + 机体朝向(3) + 安全边际(1)]
-# - 有里程计：10维 [当前速度(3) + 目标速度(3) + 机体朝向(3) + 安全边际(1)]
-# 输出维度：6维 [将被重塑为(3,2)，分别表示期望加速度和速度预测]
+# =============== 创建视觉-运动融合策略网络 ===============
+# 网络架构：CNN特征提取 + 状态编码 + GRU记忆 + MLP策略输出
+# 状态向量设计（机体坐标系）：
+# - 基础状态：目标速度(3) + 机体Z轴朝向(3) + 安全边际(1) = 7维
+# - 完整状态：当前速度(3) + 基础状态(7) = 10维
+# 动作输出：6维向量重塑为[3x2]矩阵，列0为期望加速度，列1为速度估计
 if args.no_odom:
-    model = Model(7, 6)     # 仅视觉输入
+    model = Model(7, 6)     # 纯视觉模式：无当前速度输入，依赖网络从视觉估计
 else:
-    model = Model(7+3, 6)   # 视觉 + 里程计输入
+    model = Model(7+3, 6)   # 多模态融合：视觉+里程计，提供当前速度真值
 model = model.to(device)
 
-# 从检查点恢复模型（可选）
+# =============== 模型检查点恢复 ===============
 if args.resume:
     state_dict = torch.load(args.resume, map_location=device)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, False)
     if missing_keys:
-        print("missing_keys:", missing_keys)
+        print("模型加载缺失参数:", missing_keys)
     if unexpected_keys:
-        print("unexpected_keys:", unexpected_keys)
+        print("模型加载多余参数:", unexpected_keys)
 
-# 配置优化器和学习率调度器
-optim = AdamW(model.parameters(), args.lr)
-# 余弦退火调度器：从初始学习率衰减到0.01倍
+# =============== 优化器配置 ===============
+optim = AdamW(model.parameters(), args.lr)  # AdamW优化器，适合Transformer类架构
+# 余弦退火学习率调度：训练后期学习率降至初始值的1%，平滑收敛
 sched = CosineAnnealingLR(optim, args.num_iters, args.lr * 0.01)
 
-# 控制时间步长（秒），对应15Hz控制频率
-ctl_dt = 1 / 15
+# =============== 物理仿真时间参数 ===============
+ctl_dt = 1 / 15  # 控制频率15Hz，每步约67ms，平衡实时性和稳定性
 
 
-# 用于累积标量日志，便于平滑显示
-scaler_q = defaultdict(list)
+# =============== 训练监控和可视化工具 ===============
+scaler_q = defaultdict(list)  # 损失值累积队列，用于TensorBoard平滑显示
 def smooth_dict(ori_dict):
-    """将标量字典添加到累积队列中，用于TensorBoard平滑显示"""
+    """
+    损失值平滑处理：将当前迭代的损失值加入累积队列
+    Args:
+        ori_dict: 包含各项损失值的字典
+    """
     for k, v in ori_dict.items():
         scaler_q[k].append(float(v))
 
 def barrier(x: torch.Tensor, v_to_pt):
-    """屏障函数：当距离x小于1时产生二次惩罚，v_to_pt为速度权重"""
+    """
+    二次屏障函数：实现软约束避障
+    Args:
+        x: 标准化距离（1为安全边界）
+        v_to_pt: 基于接近速度的权重，快速接近时权重更大
+    Returns:
+        当x<1时的二次惩罚，距离越近惩罚越大
+    """
     return (v_to_pt * (1 - x).relu().pow(2)).mean()
 
 def is_save_iter(i):
-    """判断是否保存可视化：前2000次迭代每250次保存，之后每1000次保存"""
+    """
+    自适应可视化保存策略：训练初期密集保存，后期稀疏保存
+    Args:
+        i: 当前迭代次数
+    Returns:
+        是否保存当前迭代的可视化结果
+    """
     if i < 2000:
-        return (i + 1) % 250 == 0
-    return (i + 1) % 1000 == 0
+        return (i + 1) % 250 == 0  # 前2000次：每250次保存（密集）
+    return (i + 1) % 1000 == 0     # 后续：每1000次保存（稀疏）
 
-# 创建训练进度条
-pbar = tqdm(range(args.num_iters), ncols=80)
-B = args.batch_size  # 批次大小缩写
+# =============== 训练主循环初始化 ===============
+pbar = tqdm(range(args.num_iters), ncols=80)  # 进度条，显示训练进度
+B = args.batch_size  # 批次大小别名，简化后续代码
 
-# =============== 主训练循环 ===============
+# =============== 主训练循环：端到端序列学习 ===============
 for i in pbar:
-    # 重置环境和模型状态，开始新的训练序列
-    env.reset()          # 重新生成随机环境（障碍物、起点终点等）
-    model.reset()        # 重置模型状态（主要是隐状态）
+    # =============== 每个序列开始时的状态重置 ===============
+    env.reset()    # 重新生成随机环境：障碍物分布、起终点位置、物理参数等
+    model.reset()  # 重置GRU隐状态，确保序列间独立性
     
-    # 初始化历史记录列表，用于存储整个序列的轨迹数据
-    p_history = []           # 位置历史 [T, B, 3]
-    v_history = []           # 速度历史 [T, B, 3]
-    target_v_history = []    # 目标速度历史 [T, B, 3]
-    vec_to_pt_history = []   # 到最近障碍点的向量历史 [T, B, 3]
-    act_diff_history = []    # 动作差分历史（未使用）
-    v_preds = []             # 网络预测的速度 [T, B, 3]
-    vid = []                 # 视频帧（用于可视化）
-    v_net_feats = []         # 网络特征（未使用）
-    h = None                 # GRU隐状态
+    # =============== 轨迹数据存储初始化 ===============
+    # 所有历史记录用于计算时序损失函数和反向传播
+    p_history = []           # 位置轨迹 [T, B, 3]：用于可视化和约束检查
+    v_history = []           # 速度轨迹 [T, B, 3]：主要训练信号
+    target_v_history = []    # 目标速度轨迹 [T, B, 3]：任务目标
+    vec_to_pt_history = []   # 避障向量轨迹 [T, B, 3]：最近障碍点方向
+    act_diff_history = []    # [未使用] 动作变化轨迹
+    v_preds = []             # 网络速度预测 [T, B, 3]：用于自监督学习
+    vid = []                 # 深度图序列：用于训练可视化
+    v_net_feats = []         # [未使用] 网络中间特征
+    h = None                 # GRU隐状态：维持时序记忆
 
-    # 动作延迟缓冲区，模拟真实控制系统的延迟
-    act_lag = 1
-    act_buffer = [env.act] * (act_lag + 1)  # 初始化为当前动作
+    # =============== 控制延迟建模 ===============
+    # 模拟真实系统中传感器-计算-执行的延迟链路
+    act_lag = 1  # 1步延迟（约67ms）
+    act_buffer = [env.act] * (act_lag + 1)  # 初始化延迟缓冲区
     
-    # 计算初始目标速度向量（从当前位置指向目标位置）
-    target_v_raw = env.p_target - env.p
+    # =============== 初始导航目标设定 ===============
+    target_v_raw = env.p_target - env.p  # 指向目标的原始方向向量
     
-    # 可选：添加偏航漂移扰动，模拟真实飞行中的姿态漂移
+    # =============== 可选：偏航漂移扰动建模 ===============
+    # 模拟真实飞行中GPS拒止环境下的姿态估计偏差
     if args.yaw_drift:
-        # 生成随机偏航角速度（约5度/秒 / 15Hz）
+        # 生成随机偏航角速度：约5°/s的偏差，模拟IMU积累误差
         drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 / 15)
         zeros = torch.zeros_like(drift_av)
         ones = torch.ones_like(drift_av)
-        # 构造绕Z轴的旋转矩阵
+        # 构造绕Z轴（世界垂直轴）的旋转矩阵
         R_drift = torch.stack([
-            torch.cos(drift_av), -torch.sin(drift_av), zeros,
-            torch.sin(drift_av), torch.cos(drift_av), zeros,
-            zeros, zeros, ones,
+            torch.cos(drift_av), -torch.sin(drift_av), zeros,  # 第一行
+            torch.sin(drift_av), torch.cos(drift_av), zeros,   # 第二行
+            zeros, zeros, ones,                                # 第三行
         ], -1).reshape(B, 3, 3)
 
 
-    # =============== 时序展开循环（模拟飞行过程）===============
+    # =============== 时序展开循环：逐步仿真飞行过程 ===============
+    # 每个时间步包含：感知→决策→动作→物理更新的完整闭环
     for t in range(args.timesteps):
-        # 添加控制频率的随机抖动，模拟真实系统的时间不确定性
-        ctl_dt = normalvariate(1 / 15, 0.1 / 15)  # 15Hz ± 10%
+        # =============== 控制频率随机化 ===============
+        # 模拟真实系统中控制周期的微小变化（网络延迟、计算负载等）
+        ctl_dt = normalvariate(1 / 15, 0.1 / 15)  # 15Hz ± 10%变化
         
-        # 渲染深度图和光流（当前仅使用深度图）
-        depth, flow = env.render(ctl_dt)
+        # =============== 视觉感知：深度图渲染 ===============
+        depth, flow = env.render(ctl_dt)  # depth: [B, H, W], flow: 当前未使用
         
-        # 记录当前状态
-        p_history.append(env.p)                          # 记录位置
-        vec_to_pt_history.append(env.find_vec_to_nearest_pt())  # 记录到最近障碍点的向量
+        # =============== 状态记录与数据收集 ===============
+        p_history.append(env.p)                                    # 当前位置
+        vec_to_pt_history.append(env.find_vec_to_nearest_pt())     # 避障向量：当前位置到最近障碍物表面
 
-        # 保存可视化帧（仅在特定迭代）
+        # =============== 训练可视化数据收集 ===============
         if is_save_iter(i):
-            vid.append(depth[4])  # 保存第5个batch的深度图用于可视化
+            vid.append(depth[4])  # 保存batch中第5个无人机的深度图，用于TensorBoard可视化
 
-        # 更新目标速度向量
+        # =============== 目标方向更新策略 ===============
         if args.yaw_drift:
-            # 应用偏航漂移：旋转目标速度向量
+            # 偏航漂移模式：累积旋转目标向量，模拟姿态估计误差
             target_v_raw = torch.squeeze(target_v_raw[:, None] @ R_drift, 1)
         else:
-            # 正常模式：重新计算目标速度向量
-            target_v_raw = env.p_target - env.p.detach()
+            # 标准模式：实时重新计算指向目标的向量
+            target_v_raw = env.p_target - env.p.detach()  # detach切断梯度，避免目标位置被"学习"
             
-        # 运行一步物理仿真：更新位置、速度、加速度
+        # =============== 物理仿真步进 ===============
+        # 执行一步完整的四旋翼动力学仿真：姿态控制+动力学积分
         env.run(act_buffer[t], ctl_dt, target_v_raw)
 
         # =============== 构造机体坐标系和状态向量 ===============

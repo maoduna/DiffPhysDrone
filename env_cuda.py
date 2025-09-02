@@ -6,51 +6,79 @@ import torch.nn.functional as F
 import quadsim_cuda
 
 
-# =============== 梯度衰减函数 ===============
-# 用于长时序梯度稳定，防止梯度爆炸
+# =============== 梯度衰减自定义函数 ===============
+# 解决可微分长时序仿真中的梯度爆炸问题
 class GDecay(torch.autograd.Function):
+    """
+    梯度衰减函数：前向传播保持数值不变，反向传播时应用指数衰减
+    用途：在长时序反向传播中防止梯度指数级增长
+    原理：通过乘以小于1的系数逐步衰减早期时间步的梯度影响
+    """
     @staticmethod
     def forward(ctx, x, alpha):
-        """前向传播：直接返回输入，但保存衰减因子"""
+        """
+        前向传播：透明传递输入值
+        Args:
+            x: 输入张量
+            alpha: 梯度衰减系数 (0,1)，越小衰减越强
+        """
         ctx.alpha = alpha
         return x
 
     @staticmethod
     def backward(ctx, grad_output):
-        """反向传播：对梯度应用衰减因子"""
+        """
+        反向传播：对输入梯度应用衰减
+        Args:
+            grad_output: 来自上游的梯度
+        Returns:
+            衰减后的梯度，None（alpha不需要梯度）
+        """
         return grad_output * ctx.alpha, None
 
-g_decay = GDecay.apply
+g_decay = GDecay.apply  # 创建函数别名，简化调用
 
 
-# =============== 可微分动力学函数 ===============
-# 封装CUDA核的前向和反向传播，实现可微分物理仿真
+# =============== 可微分四旋翼动力学封装 ===============
+# 将CUDA实现的物理仿真核心包装为PyTorch自动微分函数
 class RunFunction(torch.autograd.Function):
+    """
+    可微分四旋翼动力学仿真函数
+    
+    功能：执行一个时间步的完整四旋翼物理仿真，包括：
+    1. 控制系统：一阶延迟滤波器模拟执行器延迟
+    2. 阻力模型：线性+二次阻力，分别考虑机体各轴
+    3. 扰动建模：重力场不均匀性、风场扰动
+    4. 运动积分：基于Verlet积分的位置和速度更新
+    5. 梯度衰减：防止长时序反向传播中的梯度爆炸
+    """
     @staticmethod
     def forward(ctx, R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, grad_decay, ctl_dt, airmode):
         """
         前向传播：执行一步物理仿真
-        参数说明：
-        - R: 机体姿态矩阵 [B, 3, 3]
-        - dg: 重力扰动 [B, 3]
-        - z_drag_coef: Z轴阻力系数 [B, 1]
-        - drag_2: 阻力系数 [B, 2] (线性+二次)
-        - pitch_ctl_delay: 俯仰控制延迟 [B, 1]
-        - act_pred: 预测动作 [B, 3]
-        - act: 当前动作 [B, 3]
-        - p: 位置 [B, 3]
-        - v: 速度 [B, 3]
-        - v_wind: 风速 [B, 3]
-        - a: 加速度 [B, 3]
-        - grad_decay: 梯度衰减因子
-        - ctl_dt: 控制时间步长
-        - airmode: 空气模式参数
+        Args:
+            R: 机体姿态矩阵 [B,3,3] - 当前机体到世界坐标系的旋转
+            dg: 重力扰动 [B,3] - 模拟重力场不均匀性
+            z_drag_coef: Z轴阻力系数 [B,1] - 上升/下降时的额外阻力
+            drag_2: 阻力系数 [B,2] - [二次项,一次项]空气阻力参数
+            pitch_ctl_delay: 俯仰控制延迟 [B,1] - 模拟电机响应延迟
+            act_pred: 预测动作 [B,3] - 网络输出的期望加速度
+            act: 当前动作 [B,3] - 上一时刻的实际输出
+            p: 位置 [B,3] - 当前世界坐标位置
+            v: 速度 [B,3] - 当前世界坐标速度
+            v_wind: 风速 [B,3] - 环境风场速度
+            a: 加速度 [B,3] - 当前加速度
+            grad_decay: 梯度衰减因子 - 控制长时序稳定性
+            ctl_dt: 控制时间步长 - 物理仿真时间间隔
+            airmode: 空气模式参数 - 高速飞行时的角速度阻尼
+        Returns:
+            (act_next, p_next, v_next, a_next): 下一时刻状态
         """
-        # 调用CUDA核执行前向仿真
+        # 调用CUDA核心执行高效并行物理仿真
         act_next, p_next, v_next, a_next = quadsim_cuda.run_forward(
             R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, ctl_dt, airmode)
         
-        # 保存反向传播需要的张量
+        # 保存反向传播需要的中间变量
         ctx.save_for_backward(R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next)
         ctx.grad_decay = grad_decay
         ctx.ctl_dt = ctl_dt
@@ -59,70 +87,87 @@ class RunFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, d_act_next, d_p_next, d_v_next, d_a_next):
         """
-        反向传播：计算梯度
-        返回：对各个输入参数的梯度
+        反向传播：计算物理仿真对输入参数的梯度
+        Args:
+            d_act_next, d_p_next, d_v_next, d_a_next: 来自损失函数的输出梯度
+        Returns:
+            输入参数的梯度：与forward参数一一对应，None表示不需要梯度
         """
         R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next = ctx.saved_tensors
+        # 调用CUDA核心执行反向传播梯度计算
         d_act_pred, d_act, d_p, d_v, d_a = quadsim_cuda.run_backward(
             R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next, d_act_next, d_p_next, d_v_next, d_a_next,
             ctx.grad_decay, ctx.ctl_dt)
-        # 返回梯度，None表示不需要梯度的参数
+        # 返回梯度：与forward参数顺序一致，None表示该参数不参与梯度计算
         return None, None, None, None, None, d_act_pred, d_act, d_p, d_v, None, d_a, None, None, None
 
-run = RunFunction.apply
+run = RunFunction.apply  # 创建函数别名，简化调用
 
 
-# =============== 可微分物理仿真环境 ===============
+# =============== 四旋翼仿真环境主类 ===============
 class Env:
+    """
+    集成式四旋翼仿真环境
+    
+    核心功能：
+    1. 随机场景生成：多样化障碍物分布、起终点配置
+    2. 物理仿真：高精度四旋翼动力学模型
+    3. 视觉渲染：实时深度图生成，支持多种几何体
+    4. 碰撞检测：精确的最近点查询算法
+    5. 编队仿真：支持多无人机协同训练
+    """
     def __init__(self, batch_size, width, height, grad_decay, device='cpu', fov_x_half_tan=0.53,
                  single=False, gate=False, ground_voxels=False, scaffold=False, speed_mtp=1,
                  random_rotation=False, cam_angle=10) -> None:
         """
-        初始化仿真环境
-        参数说明：
-        - batch_size: 批次大小（同时仿真的无人机数量）
-        - width, height: 深度图分辨率
-        - grad_decay: 梯度衰减因子
-        - fov_x_half_tan: 相机水平视场角的半角正切值
-        - single: 单机模式（vs多机编队）
-        - gate: 是否添加门型障碍物
-        - ground_voxels: 是否添加地面体素障碍
-        - scaffold: 是否添加脚手架结构
-        - speed_mtp: 速度倍数
-        - random_rotation: 是否随机旋转环境
-        - cam_angle: 相机俯仰角度（度）
+        初始化四旋翼仿真环境
+        Args:
+            batch_size: 并行仿真的无人机数量（影响GPU内存和计算效率）
+            width, height: 深度图分辨率（通常64x48，4x下采样到16x12输入网络）
+            grad_decay: 梯度衰减因子 ∈ (0,1)，控制长时序梯度稳定性
+            device: 计算设备 ('cpu' | 'cuda')
+            fov_x_half_tan: 水平视场角半角正切值，决定观察范围
+            single: 是否启用单机模式（vs多机编队避障）
+            gate: 是否生成门型障碍物（穿越任务）
+            ground_voxels: 是否生成地面体素障碍（地形建模）
+            scaffold: 是否生成脚手架结构（结构化环境）
+            speed_mtp: 速度倍率，影响最大飞行速度和任务难度
+            random_rotation: 是否随机旋转环境（增强泛化）
+            cam_angle: 相机俯仰角度（度），模拟真实安装角度
         """
-        # 基础配置
+        # =============== 环境基础配置 ===============
         self.device = device
         self.batch_size = batch_size
         self.width = width
         self.height = height
         self.grad_decay = grad_decay
         
-        # =============== 障碍物生成参数 ===============
-        # 球体障碍物：位置范围(x,y,z) + 半径范围
-        self.ball_w = torch.tensor([8., 18, 6, 0.2], device=device)      # 宽度：x范围8m, y范围18m, z范围6m, 半径0.2m
-        self.ball_b = torch.tensor([0., -9, -1, 0.4], device=device)     # 偏移：x中心0m, y中心-9m, z中心-1m, 半径偏移0.4m
+        # =============== 障碍物几何参数配置 ===============
+        # 定义各种障碍物的空间分布和尺寸范围，支持随机生成多样化场景
         
-        # 体素障碍物：位置范围(x,y,z) + 尺寸范围(rx,ry,rz)
-        self.voxel_w = torch.tensor([8., 18, 6, 0.1, 0.1, 0.1], device=device)  # 宽度
-        self.voxel_b = torch.tensor([0., -9, -1, 0.2, 0.2, 0.2], device=device)  # 偏移
+        # 球体障碍物参数：[x范围, y范围, z范围, 半径范围]
+        self.ball_w = torch.tensor([8., 18, 6, 0.2], device=device)      # 分布宽度：8m×18m×6m空间，半径变化0.2m
+        self.ball_b = torch.tensor([0., -9, -1, 0.4], device=device)     # 分布中心：x=0, y=-9, z=-1，基础半径0.4m
         
-        # 地面体素：用于ground_voxels模式
-        self.ground_voxel_w = torch.tensor([8., 18,  0, 2.9, 2.9, 1.9], device=device)
-        self.ground_voxel_b = torch.tensor([0., -9, -1, 0.1, 0.1, 0.1], device=device)
+        # 长方体体素障碍物参数：[x范围, y范围, z范围, x尺寸范围, y尺寸范围, z尺寸范围]
+        self.voxel_w = torch.tensor([8., 18, 6, 0.1, 0.1, 0.1], device=device)  # 位置分布宽度 + 尺寸变化范围
+        self.voxel_b = torch.tensor([0., -9, -1, 0.2, 0.2, 0.2], device=device)  # 位置分布中心 + 基础尺寸
         
-        # 圆柱体障碍物：位置范围(x,y) + 半径范围
-        self.cyl_w = torch.tensor([8., 18, 0.35], device=device)         # 宽度：x,y范围, 半径0.35m
-        self.cyl_b = torch.tensor([0., -9, 0.05], device=device)         # 偏移：x,y中心, 半径偏移0.05m
+        # 地面体素参数：用于构建地面地形和建筑
+        self.ground_voxel_w = torch.tensor([8., 18,  0, 2.9, 2.9, 1.9], device=device)  # z范围为0（贴地），大尺寸
+        self.ground_voxel_b = torch.tensor([0., -9, -1, 0.1, 0.1, 0.1], device=device)  # z=-1（地面以下）
         
-        # 水平圆柱体：位置范围(x,z) + 半径范围
-        self.cyl_h_w = torch.tensor([8., 6, 0.1], device=device)         # 宽度：x,z范围, 半径0.1m
-        self.cyl_h_b = torch.tensor([0., 0, 0.05], device=device)        # 偏移：x,z中心, 半径偏移0.05m
+        # 垂直圆柱体参数：[x范围, y范围, 半径范围]（z轴无限高）
+        self.cyl_w = torch.tensor([8., 18, 0.35], device=device)         # 8m×18m分布，半径变化0.35m
+        self.cyl_b = torch.tensor([0., -9, 0.05], device=device)         # 中心位置，基础半径0.05m
         
-        # 门型障碍物：位置范围(x,y,z) + 半径范围
-        self.gate_w = torch.tensor([2.,  2,  1.0, 0.5], device=device)   # 宽度
-        self.gate_b = torch.tensor([3., -1,  0.0, 0.5], device=device)   # 偏移
+        # 水平圆柱体参数：[x范围, z范围, 半径范围]（y轴无限长）
+        self.cyl_h_w = torch.tensor([8., 6, 0.1], device=device)         # 8m×6m分布，半径变化0.1m
+        self.cyl_h_b = torch.tensor([0., 0, 0.05], device=device)        # 中心位置，基础半径0.05m
+        
+        # 门型障碍物参数：[x范围, y范围, z范围, 孔径范围]
+        self.gate_w = torch.tensor([2.,  2,  1.0, 0.5], device=device)   # 2m×2m×1m分布，孔径变化0.5m
+        self.gate_b = torch.tensor([3., -1,  0.0, 0.5], device=device)   # 位置偏移，基础孔径0.5m
         
         # =============== 环境参数 ===============
         self.v_wind_w = torch.tensor([1,  1,  0.2], device=device)       # 风速范围：x,y,z方向

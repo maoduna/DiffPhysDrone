@@ -1,7 +1,18 @@
 /**
  * @file dynamics_kernel.cu
- * @brief 四旋翼无人机动力学仿真CUDA核心函数
- * @details 包含状态更新、前向传播和反向传播等核心动力学计算功能
+ * @brief 四旋翼无人机动力学仿真CUDA核心实现
+ * @details 高性能并行计算的四旋翼物理引擎，包含：
+ *          1. 姿态控制：基于推力矢量的姿态解算
+ *          2. 动力学仿真：考虑阻力、扰动的运动积分
+ *          3. 可微分计算：支持自动微分的前向和反向传播
+ *          4. 批量并行：同时处理数百个无人机实例
+ * 
+ * 物理模型特点：
+ * - 六自由度刚体动力学
+ * - 分轴阻力建模（考虑机体各轴向的不同阻力特性）
+ * - 控制系统延迟建模
+ * - 环境扰动（风场、重力场不均匀性）
+ * - 空气动力学效应（高速飞行时的额外阻力）
  */
 
 #include <torch/extension.h>
@@ -14,15 +25,21 @@
 namespace {
 
 /**
- * @brief 更新状态向量CUDA核心函数
- * @details 根据推力指令和预测速度更新无人机的旋转矩阵
+ * @brief 四旋翼姿态更新CUDA核心函数
+ * @details 基于推力矢量和速度预测更新机体姿态矩阵
  * 
- * @param R_new 输出新旋转矩阵 [batch, 3, 3]
- * @param R 当前旋转矩阵 [batch, 3, 3]
- * @param a_thr 推力指令 [batch, 3] (ax, ay, az)
- * @param v_pred 预测速度 [batch, 3] (vx, vy, vz)
- * @param alpha 平滑因子 [batch, 1]
- * @param yaw_inertia 偏航惯性系数
+ * 算法原理：
+ * 1. 推力矢量决定机体上轴方向（垂直于旋翼平面）
+ * 2. 速度预测与惯性项结合决定机体前轴方向
+ * 3. 叉积计算得到机体左轴，构成右手坐标系
+ * 4. 平滑插值确保姿态变化连续性
+ * 
+ * @param R_new 输出新旋转矩阵 [batch, 3, 3] 机体→世界坐标变换
+ * @param R 当前旋转矩阵 [batch, 3, 3] 
+ * @param a_thr 推力指令 [batch, 3] 世界坐标系下的推力矢量
+ * @param v_pred 预测速度 [batch, 3] 期望飞行方向
+ * @param alpha 平滑因子 [batch, 1] 姿态变化速率控制
+ * @param yaw_inertia 偏航惯性系数 偏航轴相对其他轴的惯性比
  */
 template <typename scalar_t>
 __global__ void update_state_vec_cuda_kernel(
@@ -33,55 +50,68 @@ __global__ void update_state_vec_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> alpha,
     float yaw_inertia) {
     
-    // 计算当前线程对应的无人机索引
+    // =============== 线程索引计算 ===============
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     const int B = R.size(0);
-    if (b >= B) return;
+    if (b >= B) return;  // 边界检查：超出批次范围的线程直接返回
     
-    // 获取推力指令并添加重力
+    // =============== 推力矢量处理 ===============
+    // 获取网络输出的推力指令，需要补偿重力以获得净推力
     scalar_t ax = a_thr[b][0];
     scalar_t ay = a_thr[b][1];
-    scalar_t az = a_thr[b][2] + 9.80665;  // 添加重力加速度
+    scalar_t az = a_thr[b][2] + 9.80665;  // 补偿重力：网络输出 + 重力加速度
     
-    // 计算推力大小
+    // 计算总推力大小（用于归一化）
     scalar_t thrust = sqrt(ax*ax+ay*ay+az*az);
     
-    // 计算上向量（推力方向）
-    scalar_t ux = ax / thrust;
-    scalar_t uy = ay / thrust;
-    scalar_t uz = az / thrust;
+    // =============== 机体上轴计算（推力方向）===============
+    // 四旋翼的上轴始终指向总推力方向
+    scalar_t ux = ax / thrust;  // 上轴x分量
+    scalar_t uy = ay / thrust;  // 上轴y分量
+    scalar_t uz = az / thrust;  // 上轴z分量
     
-    // 计算前向向量（考虑偏航惯性）
-    scalar_t fx = R[b][0][0] * yaw_inertia + v_pred[b][0];
+    // =============== 机体前轴计算（飞行方向）===============
+    // 结合当前前向和预测速度，考虑偏航惯性
+    scalar_t fx = R[b][0][0] * yaw_inertia + v_pred[b][0];  // 惯性项 + 期望方向
     scalar_t fy = R[b][1][0] * yaw_inertia + v_pred[b][1];
     scalar_t fz = R[b][2][0] * yaw_inertia + v_pred[b][2];
     
-    // 归一化前向向量
+    // 归一化组合向量
     scalar_t t = sqrt(fx * fx + fy * fy + fz * fz);
-    fx = (1 - alpha[b][0]) * (fx / t) + alpha[b][0] * R[b][0][0];
-    fy = (1 - alpha[b][0]) * (fy / t) + alpha[b][0] * R[b][1][0];
-    fz = (1 - alpha[b][0]) * (fz / t) + alpha[b][0] * R[b][2][0];
+    fx /= t;
+    fy /= t;
+    fz /= t;
     
-    // 确保前向向量垂直于上向量（z分量约束）
-    fz = (fx * ux + fy * uy) / -uz;
+    // 应用平滑因子：在新方向和当前方向间插值
+    fx = (1 - alpha[b][0]) * fx + alpha[b][0] * R[b][0][0];
+    fy = (1 - alpha[b][0]) * fy + alpha[b][0] * R[b][1][0];
+    fz = (1 - alpha[b][0]) * fz + alpha[b][0] * R[b][2][0];
     
-    // 重新归一化前向向量
+    // =============== 正交性约束：前轴必须垂直于上轴 ===============
+    // 通过投影消除前轴在上轴方向的分量
+    fz = -(fx * ux + fy * uy) / uz;  // 确保 (fx,fy,fz) ⊥ (ux,uy,uz)
+    
+    // 重新归一化前向量，确保单位长度
     t = sqrt(fx * fx + fy * fy + fz * fz);
     fx /= t;
     fy /= t;
     fz /= t;
     
-    // 计算左向量（叉积：上向量 × 前向向量）
-    // 构建新的旋转矩阵 [前向向量, 左向量, 上向量]
-    R_new[b][0][0] = fx;                    // 前向向量的x分量
-    R_new[b][0][1] = uy * fz - uz * fy;     // 左向量的x分量
-    R_new[b][0][2] = ux;                    // 上向量的x分量
-    R_new[b][1][0] = fy;                    // 前向向量的y分量
-    R_new[b][1][1] = uz * fx - ux * fz;     // 左向量的y分量
-    R_new[b][1][2] = uy;                    // 上向量的y分量
-    R_new[b][2][0] = fz;                    // 前向向量的z分量
-    R_new[b][2][1] = ux * fy - uy * fx;     // 左向量的z分量
-    R_new[b][2][2] = uz;                    // 上向量的z分量
+    // =============== 构造完整旋转矩阵 ===============
+    // 使用右手定则构造正交坐标系：[前轴, 左轴, 上轴]
+    // 左轴 = 上轴 × 前轴
+    
+    R_new[b][0][0] = fx;                    // 前轴x分量
+    R_new[b][0][1] = uy * fz - uz * fy;     // 左轴x分量 (上×前)
+    R_new[b][0][2] = ux;                    // 上轴x分量
+    
+    R_new[b][1][0] = fy;                    // 前轴y分量
+    R_new[b][1][1] = uz * fx - ux * fz;     // 左轴y分量 (上×前)
+    R_new[b][1][2] = uy;                    // 上轴y分量
+    
+    R_new[b][2][0] = fz;                    // 前轴z分量
+    R_new[b][2][1] = ux * fy - uy * fx;     // 左轴z分量 (上×前)
+    R_new[b][2][2] = uz;                    // 上轴z分量
 }
 
 /**
